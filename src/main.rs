@@ -93,7 +93,7 @@ async fn main() {
         });
 
     let console = warp::get()
-        .and(warp::path("/"))
+        .and(warp::filters::path::end())
         .map(move || {
             let jobs = jobs.read().unwrap();
             let jobs_text = jobs.iter()
