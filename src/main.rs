@@ -1,10 +1,20 @@
-use warp::{Filter, Rejection, reject};
+use std::path::PathBuf;
+use std::process::Command;
+use warp::{Filter, Rejection, Reply, reject, http::StatusCode};
 use sha1::Sha1;
 use hmac::{Hmac, Mac};
 
 #[derive(Debug)]
 struct InvalidSignature;
 impl reject::Reject for InvalidSignature {}
+
+#[derive(Debug)]
+struct InvalidApplication;
+impl reject::Reject for InvalidApplication {}
+
+#[derive(Debug)]
+struct FailedDeploy;
+impl reject::Reject for FailedDeploy {}
 
 fn verify_signature(secret: Vec<u8>) -> impl Filter<Extract = (), Error = Rejection> + Clone {
     warp::body::content_length_limit(1024 * 32)
@@ -34,9 +44,17 @@ async fn main() {
         .parse()
         .expect("`console_port` environment variable must be a number");
     let deploy = warp::path!("deploy" / String)
-        .and(verify_signature(secret.as_bytes().to_owned()))
-        .map(|app| {
-            format!("Deploying {}", app)
+        .and(verify_signature(secret.into_bytes()))
+        .and_then(|app| async move {
+            let script = PathBuf::from(format!("{}.deploy", app));
+            if !script.is_file() {
+                return Err(reject::custom(InvalidApplication));
+            }
+            match Command::new(script).status() {
+                Ok(status) if status.success() => Ok(warp::reply::reply().into_response()),
+                Ok(status) => Ok(warp::reply::with_status(format!("Deploy failed. Exit code: {}", status.code().unwrap()), StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+                Err(error) => Ok(warp::reply::with_status(format!("Deploy failed. Error: {}", error), StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+            }
         });
     warp::serve(deploy).run(([127, 0, 0, 1], port)).await;
 }
