@@ -5,7 +5,7 @@ use sha1::Sha1;
 use hmac::{Hmac, Mac};
 
 #[derive(Debug)]
-struct InvalidSignature;
+struct InvalidSignature(String);
 impl reject::Reject for InvalidSignature {}
 
 #[derive(Debug)]
@@ -28,7 +28,7 @@ fn verify_signature(secret: Vec<u8>) -> impl Filter<Extract = (), Error = Reject
             async move {
                 match result {
                     Ok(()) => Ok(()),
-                    Err(..) => Err(reject::custom(InvalidSignature)),
+                    Err(error) => Err(reject::custom(InvalidSignature(format!("{}", error)))),
                 }
             }
         })
