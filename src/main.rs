@@ -23,12 +23,10 @@ fn verify_signature(secret: Vec<u8>) -> impl Filter<Extract = (), Error = Reject
         .and_then(move |body: bytes::Bytes, signature: String| {
             let mut hmac = Hmac::<Sha1>::new_varkey(&secret).expect("failed to set up HMAC");
             hmac.input(body.as_ref());
-            let result = hmac.result().code();
             async move {
-                match Err(3) {
-                    Ok(()) => Ok(()),
-                    Err(error) => Err(reject::custom(InvalidSignature(format!("{} {:x?} {}", error, result, signature)))),
-                }
+                hex::decode(&signature[5..])
+                    .map_err(|err| reject::custom(InvalidSignature(format!("{}", err))))
+                    .and_then(|sig| hmac.verify(&sig).map_err(|err| reject::custom(InvalidSignature(format!("{}", err)))))
             }
         })
         .untuple_one()
