@@ -27,7 +27,7 @@ fn verify_signature(secret: Vec<u8>) -> impl Filter<Extract = (), Error = Reject
             async move {
                 match result {
                     Ok(()) => Ok(()),
-                    Err(error) => Err(reject::custom(InvalidSignature(format!("{}", error)))),
+                    Err(error) => Err(reject::custom(InvalidSignature(format!("{} {}", error, signature)))),
                 }
             }
         })
