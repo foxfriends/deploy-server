@@ -47,10 +47,10 @@ async fn main() {
             if !script.is_file() {
                 return Err(reject::custom(InvalidApplication));
             }
-            match Command::new(script).status() {
+            match Command::new(&script).status() {
                 Ok(status) if status.success() => Ok(warp::reply::reply().into_response()),
-                Ok(status) => Ok(warp::reply::with_status(format!("Deploy failed. Exit code: {}", status.code().unwrap()), StatusCode::INTERNAL_SERVER_ERROR).into_response()),
-                Err(error) => Ok(warp::reply::with_status(format!("Deploy failed. Error: {}", error), StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+                Ok(status) => Ok(warp::reply::with_status(format!("{}: Deploy failed. Exit code: {}", script.display(), status.code().unwrap()), StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+                Err(error) => Ok(warp::reply::with_status(format!("{}: Deploy failed. Error: {}", script.display(), error), StatusCode::INTERNAL_SERVER_ERROR).into_response()),
             }
         });
     warp::serve(deploy).run(([127, 0, 0, 1], port)).await;
