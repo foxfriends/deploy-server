@@ -123,7 +123,7 @@ async fn main() {
                     "#, job.app, summary, details)
                 })
                 .collect::<String>();
-            format!(r#"
+            warp::reply::html(format!(r#"
                 <!DOCTYPE HTML>
                 <html lang="en">
                     <head>
@@ -131,7 +131,7 @@ async fn main() {
                         <meta charset="utf-8" />
                     <body>{}</body>
                 </html>
-            "#, jobs_text)
+            "#, jobs_text).trim().to_owned())
         });
 
     warp::serve(deploy.or(console)).run(([127, 0, 0, 1], port)).await;
