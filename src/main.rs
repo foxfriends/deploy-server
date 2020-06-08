@@ -43,7 +43,7 @@ async fn main() {
     let deploy = warp::path!("deploy" / String)
         .and(verify_signature(secret.into_bytes()))
         .and_then(|app| async move {
-            let script = PathBuf::from(format!("{}.deploy", app));
+            let script = std::env::current_dir().unwrap().join(format!("{}.deploy", app));
             if !script.is_file() {
                 return Err(reject::custom(InvalidApplication));
             }
