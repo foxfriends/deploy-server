@@ -24,7 +24,7 @@ fn verify_signature(secret: Vec<u8>) -> impl Filter<Extract = (), Error = Reject
             let mut hmac = Hmac::<Sha1>::new_varkey(&secret).expect("failed to set up HMAC");
             hmac.reset();
             hmac.input(body.as_ref());
-            let result = hmac.verify(signature.as_bytes());
+            let result = hmac.verify(signature[5..].as_bytes());
             async move {
                 match result {
                     Ok(()) => Ok(()),
