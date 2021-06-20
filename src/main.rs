@@ -1,10 +1,11 @@
-use std::sync::{Arc, RwLock};
-use std::process::{Command, Stdio};
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
+use std::future::ready;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use warp::{Filter, Rejection, Reply, reject};
-use sha1::Sha1;
-use hmac::{Hmac, Mac};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, RwLock};
+use warp::{reject, Filter, Rejection, Reply};
 
 struct Job {
     app: String,
@@ -13,7 +14,10 @@ struct Job {
 
 impl Job {
     fn new(app: String) -> Self {
-        Self { app, result: RwLock::default() }
+        Self {
+            app,
+            result: RwLock::default(),
+        }
     }
 }
 
@@ -29,17 +33,39 @@ impl reject::Reject for InvalidApplication {}
 struct FailedDeploy;
 impl reject::Reject for FailedDeploy {}
 
-fn verify_webhook_signature(webhook_secret: Vec<u8>) -> impl Filter<Extract = (), Error = Rejection> + Clone {
+fn verify_webhook_signature(
+    webhook_secret: Vec<u8>,
+) -> impl Filter<Extract = (), Error = Rejection> + Clone {
     warp::body::content_length_limit(1024 * 32)
         .and(warp::body::bytes())
         .and(warp::header::header("X-Hub-Signature"))
         .and_then(move |body: bytes::Bytes, signature: String| {
-            let mut hmac = Hmac::<Sha1>::new_varkey(&webhook_secret).expect("failed to set up HMAC");
+            let mut hmac =
+                Hmac::<Sha1>::new_varkey(&webhook_secret).expect("failed to set up HMAC");
             hmac.input(body.as_ref());
             async move {
                 hex::decode(&signature[5..])
                     .map_err(|err| reject::custom(InvalidSignature(format!("{}", err))))
-                    .and_then(|sig| hmac.verify(&sig).map_err(|err| reject::custom(InvalidSignature(format!("{}", err)))))
+                    .and_then(|sig| {
+                        hmac.verify(&sig)
+                            .map_err(|err| reject::custom(InvalidSignature(format!("{}", err))))
+                    })
+            }
+        })
+        .untuple_one()
+}
+
+fn verify_actions_secret(
+    actions_secret: String,
+) -> impl Filter<Extract = (), Error = Rejection> + Clone {
+    warp::header::header("X-Deploy-Secret")
+        .and_then(move |secret: String| {
+            if secret == actions_secret {
+                ready(Ok(()))
+            } else {
+                ready(Err(reject::custom(InvalidSignature(String::from(
+                    "Invalid secret",
+                )))))
             }
         })
         .untuple_one()
@@ -54,7 +80,9 @@ fn deploy_app(job: Arc<Job>, script: PathBuf) {
     let mut output = BufReader::new(child.stdout.take().unwrap());
     let mut buf = String::new();
     while let Ok(n) = output.read_line(&mut buf) {
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         job.result.write().unwrap().0 += buf.as_str();
         buf.clear();
     }
@@ -69,64 +97,90 @@ fn deploy_app(job: Arc<Job>, script: PathBuf) {
     }
 }
 
+async fn resolve_deploy_script(app: String) -> Result<(String, PathBuf), Rejection> {
+    let script = std::env::current_dir()
+        .unwrap()
+        .join(format!("{}.deploy", app));
+    if !script.is_file() {
+        return Err(reject::custom(InvalidApplication));
+    }
+    Ok((app, script))
+}
+
+type Jobs = Arc<RwLock<Vec<Arc<Job>>>>;
+
+fn with_jobs(
+    jobs: Jobs,
+) -> impl Filter<Extract = (Jobs,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || jobs.clone())
+}
+
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().unwrap();
 
     let jobs: Arc<RwLock<Vec<Arc<Job>>>> = Arc::default();
-    
-    let webhook_secret: String = std::env::var("github_webhook_secret").expect("`github_webhook_secret` environment variable must be set");
+
+    let webhook_secret: String = std::env::var("github_webhook_secret")
+        .expect("`github_webhook_secret` environment variable must be set");
+    let actions_secret: String = std::env::var("github_actions_secret")
+        .expect("`github_actions_secret` environment variable must be set");
     let port: u16 = std::env::var("console_port")
         .expect("`console_port` environment variable must be set")
         .parse()
         .expect("`console_port` environment variable must be a number");
     let deploy = warp::path!("deploy" / String)
         .and(verify_webhook_signature(webhook_secret.into_bytes()))
-        .and_then({
-            let jobs = jobs.clone();
-            move |app: String| {
-                let jobs = jobs.clone();
-                async move {
-                    let script = std::env::current_dir()
-                        .unwrap()
-                        .join(format!("{}.deploy", app));
-                    if !script.is_file() {
-                        return Err(reject::custom(InvalidApplication));
-                    }
-
-                    std::thread::spawn({
-                        let app = app.clone();
-                        move || {
-                            let job = Arc::new(Job::new(app));
-                            jobs.write().unwrap().push(job.clone());
-                            deploy_app(job, script);
-                        }
-                    });
-
-                    Ok(warp::reply::reply().into_response())
+        .and_then(resolve_deploy_script)
+        .and(with_jobs(jobs.clone()))
+        .and_then(|(app, script): (String, PathBuf), jobs: Jobs| {
+            std::thread::spawn({
+                let app = app.clone();
+                move || {
+                    let job = Arc::new(Job::new(app));
+                    jobs.write().unwrap().push(job.clone());
+                    deploy_app(job, script);
                 }
-            }
+            });
+
+            ready(Ok::<_, Rejection>(warp::reply::reply().into_response()))
+        });
+    let deploy2 = warp::path!("deploy2" / String)
+        .and(verify_actions_secret(actions_secret))
+        .and_then(resolve_deploy_script)
+        .and(with_jobs(jobs.clone()))
+        .and_then(|(app, script): (String, PathBuf), jobs: Jobs| {
+            std::thread::spawn({
+                let app = app.clone();
+                move || {
+                    let job = Arc::new(Job::new(app));
+                    jobs.write().unwrap().push(job.clone());
+                    deploy_app(job, script);
+                }
+            });
+
+            ready(Ok::<_, Rejection>(warp::reply::reply().into_response()))
         });
 
-    let console = warp::get()
-        .and(warp::filters::path::end())
-        .map(move || {
-            let jobs = jobs.read().unwrap();
-            let jobs_text = jobs.iter()
-                .map(|job| {
-                    let summary;
-                    let details;
-                    match &*job.result.read().unwrap() {
-                        (output, Some(status)) => {
-                            summary = format!("Exit code: {}", status);
-                            details = output.clone();
-                        }
-                        (output, None) => {
-                            summary = "Running...".into();
-                            details = output.clone();
-                        }
-                    };
-                    format!(r#"
+    let console = warp::get().and(warp::filters::path::end()).map(move || {
+        let jobs = jobs.read().unwrap();
+        let jobs_text = jobs
+            .iter()
+            .map(|job| {
+                let summary;
+                let details;
+                match &*job.result.read().unwrap() {
+                    (output, Some(status)) => {
+                        summary = format!("Exit code: {}", status);
+                        details = output.clone();
+                    }
+                    (output, None) => {
+                        summary = "Running...".into();
+                        details = output.clone();
+                    }
+                };
+                format!(
+                    r#"
                     <div>
                         <div>
                             <b>App:</b> {}
@@ -136,10 +190,14 @@ async fn main() {
                             <pre>{}</pre>
                         </details>
                     </div>
-                    "#, job.app, summary, details)
-                })
-                .collect::<String>();
-            warp::reply::html(format!(r#"
+                    "#,
+                    job.app, summary, details
+                )
+            })
+            .collect::<String>();
+        warp::reply::html(
+            format!(
+                r#"
                 <!DOCTYPE HTML>
                 <html lang="en">
                     <head>
@@ -147,8 +205,15 @@ async fn main() {
                         <meta charset="utf-8" />
                     <body>{}</body>
                 </html>
-            "#, jobs_text).trim().to_owned())
-        });
+            "#,
+                jobs_text
+            )
+            .trim()
+            .to_owned(),
+        )
+    });
 
-    warp::serve(deploy.or(console)).run(([127, 0, 0, 1], port)).await;
+    warp::serve(deploy.or(deploy2).or(console))
+        .run(([127, 0, 0, 1], port))
+        .await;
 }
