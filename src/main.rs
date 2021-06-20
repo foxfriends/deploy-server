@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use warp::{Filter, Rejection, Reply, reject};
 use sha1::Sha1;
 use hmac::{Hmac, Mac};
@@ -44,6 +45,30 @@ fn verify_webhook_signature(webhook_secret: Vec<u8>) -> impl Filter<Extract = ()
         .untuple_one()
 }
 
+fn deploy_app(job: Arc<Job>, script: PathBuf) {
+    let mut child = Command::new(&script)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut buf = String::new();
+    while let Ok(n) = output.read_line(&mut buf) {
+        if n == 0 { break; }
+        job.result.write().unwrap().0 += buf.as_str();
+        buf.clear();
+    }
+
+    match child.wait() {
+        Ok(status) => {
+            job.result.write().unwrap().1 = Some(status.code().unwrap_or(255));
+        }
+        Err(error) => {
+            *job.result.write().unwrap() = (format!("Error: {}", error), Some(255));
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().unwrap();
@@ -61,7 +86,7 @@ async fn main() {
             let jobs = jobs.clone();
             move |app: String| {
                 let jobs = jobs.clone();
-                    async move {
+                async move {
                     let script = std::env::current_dir()
                         .unwrap()
                         .join(format!("{}.deploy", app));
@@ -74,24 +99,7 @@ async fn main() {
                         move || {
                             let job = Arc::new(Job::new(app));
                             jobs.write().unwrap().push(job.clone());
-                            let mut child = Command::new(&script).spawn().unwrap();
-
-                            let mut output = BufReader::new(child.stdout.take().unwrap());
-                            let mut buf = String::new();
-                            while let Ok(n) = output.read_line(&mut buf) {
-                                if n == 0 { break; }
-                                job.result.write().unwrap().0 += buf.as_str();
-                                buf.clear();
-                            }
-
-                            match child.wait() {
-                                Ok(status) => {
-                                    job.result.write().unwrap().1 = Some(status.code().unwrap_or(255));
-                                }
-                                Err(error) => {
-                                    *job.result.write().unwrap() = (format!("Error: {}", error), Some(255));
-                                }
-                            }
+                            deploy_app(job, script);
                         }
                     });
 
