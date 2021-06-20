@@ -1,12 +1,13 @@
 use std::sync::{Arc, RwLock};
 use std::process::Command;
+use std::io::{BufRead, BufReader};
 use warp::{Filter, Rejection, Reply, reject};
 use sha1::Sha1;
 use hmac::{Hmac, Mac};
 
 struct Job {
     app: String,
-    result: RwLock<Option<(String, u8)>>,
+    result: RwLock<(String, Option<i32>)>,
 }
 
 impl Job {
@@ -27,12 +28,12 @@ impl reject::Reject for InvalidApplication {}
 struct FailedDeploy;
 impl reject::Reject for FailedDeploy {}
 
-fn verify_signature(secret: Vec<u8>) -> impl Filter<Extract = (), Error = Rejection> + Clone {
+fn verify_webhook_signature(webhook_secret: Vec<u8>) -> impl Filter<Extract = (), Error = Rejection> + Clone {
     warp::body::content_length_limit(1024 * 32)
         .and(warp::body::bytes())
         .and(warp::header::header("X-Hub-Signature"))
         .and_then(move |body: bytes::Bytes, signature: String| {
-            let mut hmac = Hmac::<Sha1>::new_varkey(&secret).expect("failed to set up HMAC");
+            let mut hmac = Hmac::<Sha1>::new_varkey(&webhook_secret).expect("failed to set up HMAC");
             hmac.input(body.as_ref());
             async move {
                 hex::decode(&signature[5..])
@@ -49,13 +50,13 @@ async fn main() {
 
     let jobs: Arc<RwLock<Vec<Arc<Job>>>> = Arc::default();
     
-    let secret: String = std::env::var("github_webhook_secret").expect("`github_webhook_secret` environment variable must be set");
+    let webhook_secret: String = std::env::var("github_webhook_secret").expect("`github_webhook_secret` environment variable must be set");
     let port: u16 = std::env::var("console_port")
         .expect("`console_port` environment variable must be set")
         .parse()
         .expect("`console_port` environment variable must be a number");
     let deploy = warp::path!("deploy" / String)
-        .and(verify_signature(secret.into_bytes()))
+        .and(verify_webhook_signature(webhook_secret.into_bytes()))
         .and_then({
             let jobs = jobs.clone();
             move |app: String| {
@@ -73,15 +74,22 @@ async fn main() {
                         move || {
                             let job = Arc::new(Job::new(app));
                             jobs.write().unwrap().push(job.clone());
-                            match Command::new(&script).output() {
-                                Ok(output) => {
-                                    *job.result.write().unwrap() = Some((
-                                        String::from_utf8(output.stdout).unwrap_or(String::from("Invalid Output")),
-                                        output.status.code().unwrap_or(255) as u8
-                                    ));
+                            let mut child = Command::new(&script).spawn().unwrap();
+
+                            let mut output = BufReader::new(child.stdout.take().unwrap());
+                            let mut buf = String::new();
+                            while let Ok(n) = output.read_line(&mut buf) {
+                                if n == 0 { break; }
+                                job.result.write().unwrap().0 += buf.as_str();
+                                buf.clear();
+                            }
+
+                            match child.wait() {
+                                Ok(status) => {
+                                    job.result.write().unwrap().1 = Some(status.code().unwrap_or(255));
                                 }
                                 Err(error) => {
-                                    *job.result.write().unwrap() = Some((format!("Error: {}", error), 255));
+                                    *job.result.write().unwrap() = (format!("Error: {}", error), Some(255));
                                 }
                             }
                         }
@@ -101,13 +109,13 @@ async fn main() {
                     let summary;
                     let details;
                     match &*job.result.read().unwrap() {
-                        Some((output, status)) => {
+                        (output, Some(status)) => {
                             summary = format!("Exit code: {}", status);
                             details = output.clone();
                         }
-                        None => {
+                        (output, None) => {
                             summary = "Running...".into();
-                            details = "...".into();
+                            details = output.clone();
                         }
                     };
                     format!(r#"
