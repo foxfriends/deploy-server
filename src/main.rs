@@ -1,7 +1,7 @@
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use std::future::ready;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
@@ -89,6 +89,13 @@ fn deploy_app(job: Arc<Job>, script: PathBuf) {
 
     match child.wait() {
         Ok(status) => {
+            if !status.success() {
+                let mut err = String::new();
+                child.stderr.take().unwrap().read_to_string(&mut err).ok();
+                let mut job = job.result.write().unwrap();
+                job.0 += "\nSTDERR:\n";
+                job.0 += err.as_str();
+            }
             job.result.write().unwrap().1 = Some(status.code().unwrap_or(255));
         }
         Err(error) => {
