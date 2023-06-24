@@ -1,5 +1,3 @@
-use hmac::{Hmac, Mac};
-use sha1::Sha1;
 use std::future::ready;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
@@ -32,28 +30,6 @@ impl reject::Reject for InvalidApplication {}
 #[derive(Debug)]
 struct FailedDeploy;
 impl reject::Reject for FailedDeploy {}
-
-fn verify_webhook_signature(
-    webhook_secret: Vec<u8>,
-) -> impl Filter<Extract = (), Error = Rejection> + Clone {
-    warp::body::content_length_limit(1024 * 32)
-        .and(warp::body::bytes())
-        .and(warp::header::header("X-Hub-Signature"))
-        .and_then(move |body: bytes::Bytes, signature: String| {
-            let mut hmac =
-                Hmac::<Sha1>::new_from_slice(&webhook_secret).expect("failed to set up HMAC");
-            hmac.update(body.as_ref());
-            async move {
-                hex::decode(&signature[5..])
-                    .map_err(|err| reject::custom(InvalidSignature(format!("{}", err))))
-                    .and_then(|sig| {
-                        hmac.verify_slice(&sig)
-                            .map_err(|err| reject::custom(InvalidSignature(format!("{}", err))))
-                    })
-            }
-        })
-        .untuple_one()
-}
 
 fn verify_actions_secret(
     actions_secret: String,
@@ -128,30 +104,12 @@ async fn main() {
 
     let jobs: Arc<RwLock<Vec<Arc<Job>>>> = Arc::default();
 
-    let webhook_secret: String = std::env::var("github_webhook_secret")
-        .expect("`github_webhook_secret` environment variable must be set");
     let actions_secret: String = std::env::var("github_actions_secret")
         .expect("`github_actions_secret` environment variable must be set");
     let port: u16 = std::env::var("console_port")
         .expect("`console_port` environment variable must be set")
         .parse()
         .expect("`console_port` environment variable must be a number");
-    let deploy = warp::path!("deploy" / String)
-        .and(verify_webhook_signature(webhook_secret.into_bytes()))
-        .and_then(resolve_deploy_script)
-        .and(with_jobs(jobs.clone()))
-        .and_then(|(app, script): (String, PathBuf), jobs: Jobs| {
-            std::thread::spawn({
-                let app = app.clone();
-                move || {
-                    let job = Arc::new(Job::new(app));
-                    jobs.write().unwrap().push(job.clone());
-                    deploy_app(job, script);
-                }
-            });
-
-            ready(Ok::<_, Rejection>(warp::reply::reply().into_response()))
-        });
     let deploy2 = warp::path!("deploy2" / String)
         .and(verify_actions_secret(actions_secret))
         .and_then(resolve_deploy_script)
@@ -220,7 +178,7 @@ async fn main() {
         )
     });
 
-    warp::serve(deploy.or(deploy2).or(console))
+    warp::serve(deploy2.or(console))
         .run(([127, 0, 0, 1], port))
         .await;
 }
