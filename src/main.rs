@@ -41,13 +41,13 @@ fn verify_webhook_signature(
         .and(warp::header::header("X-Hub-Signature"))
         .and_then(move |body: bytes::Bytes, signature: String| {
             let mut hmac =
-                Hmac::<Sha1>::new_varkey(&webhook_secret).expect("failed to set up HMAC");
-            hmac.input(body.as_ref());
+                Hmac::<Sha1>::new_from_slice(&webhook_secret).expect("failed to set up HMAC");
+            hmac.update(body.as_ref());
             async move {
                 hex::decode(&signature[5..])
                     .map_err(|err| reject::custom(InvalidSignature(format!("{}", err))))
                     .and_then(|sig| {
-                        hmac.verify(&sig)
+                        hmac.verify_slice(&sig)
                             .map_err(|err| reject::custom(InvalidSignature(format!("{}", err))))
                     })
             }
