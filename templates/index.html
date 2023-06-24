@@ -3,6 +3,9 @@
   <head>
     <title>Jobs | cameldridge.com</title>
     <meta charset="utf-8" />
+    <style>
+      pre { margin: 0; padding: 0 }
+    </style>
   </head>
   <body>
     {% for job in jobs %}
@@ -13,10 +16,10 @@
         <div>
           {% for line in job.output %}
           {% match line %}
-          {% when OutputLine::Stderr with (line) %}
-          <pre>{{ line }}</pre>
           {% when OutputLine::Stdout with (line) %}
-          <pre style="color: #590000;">{{ line }}</pre>
+          <pre>{{ line }}</pre>
+          {% when OutputLine::Stderr with (line) %}
+          <pre style="color: #AA0000;">{{ line }}</pre>
           {% endmatch %}
           {% endfor %}
         </div>

@@ -66,11 +66,20 @@ fn verify_actions_secret(
 }
 
 async fn deploy_app(job: Arc<Job>, script: PathBuf) {
-    let mut child = Command::new(script)
+    let child = Command::new(script)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn();
+
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            let mut result = job.result.write().await;
+            result.status = Some(255);
+            result.output.push(OutputLine::Stderr(error.to_string()));
+            return;
+        }
+    };
 
     let stdout = LinesStream::new(BufReader::new(child.stdout.take().unwrap()).lines())
         .filter_map(|line| ready(line.ok()))
