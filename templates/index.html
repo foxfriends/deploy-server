@@ -9,8 +9,17 @@
     <div id="{{ job.id }}">
       <b>App:</b> {{ job.app|e }}
       <details>
-          <summary>{{ job.summary|e }}</summary>
-          <pre>{{ job.output|e }}</pre>
+        <summary>{{ job.summary|e }}</summary>
+        <div>
+          {% for line in job.output %}
+          {% match line %}
+          {% when OutputLine::Stderr with (line) %}
+          <pre>{{ line }}</pre>
+          {% when OutputLine::Stdout with (line) %}
+          <pre style="color: #590000;">{{ line }}</pre>
+          {% endmatch %}
+          {% endfor %}
+        </div>
       </details>
     </div>
     {% endfor %}

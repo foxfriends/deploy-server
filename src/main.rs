@@ -1,15 +1,33 @@
-use uuid::Uuid;
+use futures::stream::iter;
+use futures::stream::select_all::select_all;
+use futures::{join, FutureExt, StreamExt};
 use std::future::ready;
-use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, RwLock};
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::RwLock;
+use tokio_stream::wrappers::LinesStream;
+use uuid::Uuid;
 use warp::{reject, Filter, Rejection, Reply};
+
+#[derive(Clone)]
+enum OutputLine {
+    Stdout(String),
+    Stderr(String),
+}
+
+#[derive(Default)]
+struct JobResult {
+    output: Vec<OutputLine>,
+    status: Option<i32>,
+}
 
 struct Job {
     id: Uuid,
     app: String,
-    result: RwLock<(String, Option<i32>)>,
+    result: RwLock<JobResult>,
 }
 
 impl Job {
@@ -23,74 +41,74 @@ impl Job {
 }
 
 #[derive(Debug)]
-struct InvalidSignature(String);
+struct InvalidSignature;
 impl reject::Reject for InvalidSignature {}
 
 #[derive(Debug)]
 struct InvalidApplication;
 impl reject::Reject for InvalidApplication {}
 
-#[derive(Debug)]
-struct FailedDeploy;
-impl reject::Reject for FailedDeploy {}
-
 fn verify_actions_secret(
     actions_secret: String,
 ) -> impl Filter<Extract = (), Error = Rejection> + Clone {
     warp::header::header("X-Deploy-Secret")
         .and_then(move |secret: String| {
-            if secret == actions_secret {
-                ready(Ok(()))
-            } else {
-                ready(Err(reject::custom(InvalidSignature(String::from(
-                    "Invalid secret",
-                )))))
+            let is_valid = secret == actions_secret;
+            async move {
+                if is_valid {
+                    Ok(())
+                } else {
+                    Err(reject::custom(InvalidSignature))
+                }
             }
         })
         .untuple_one()
 }
 
-fn deploy_app(job: Arc<Job>, script: PathBuf) {
-    let mut child = Command::new(&script)
+async fn deploy_app(job: Arc<Job>, script: PathBuf) {
+    let mut child = Command::new(script)
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
 
-    let mut output = BufReader::new(child.stdout.take().unwrap());
-    let mut buf = String::new();
-    while let Ok(n) = output.read_line(&mut buf) {
-        if n == 0 {
-            break;
-        }
-        job.result.write().unwrap().0 += buf.as_str();
-        buf.clear();
-    }
+    let stdout = LinesStream::new(BufReader::new(child.stdout.take().unwrap()).lines())
+        .filter_map(|line| ready(line.ok()))
+        .map(OutputLine::Stdout)
+        .boxed();
+    let stderr = LinesStream::new(BufReader::new(child.stderr.take().unwrap()).lines())
+        .filter_map(|line| ready(line.ok()))
+        .map(OutputLine::Stderr)
+        .boxed();
 
-    match child.wait() {
-        Ok(status) => {
-            if !status.success() {
-                let mut err = String::new();
-                child.stderr.take().unwrap().read_to_string(&mut err).ok();
-                let mut job = job.result.write().unwrap();
-                job.0 += "\nSTDERR:\n";
-                job.0 += err.as_str();
-            }
-            job.result.write().unwrap().1 = Some(status.code().unwrap_or(255));
+    let consume = select_all(vec![stdout, stderr]).for_each({
+        let job = job.clone();
+        move |line| {
+            let job = job.clone();
+            async move { job.result.write().await.output.push(line) }
         }
-        Err(error) => {
-            *job.result.write().unwrap() = (format!("Error: {error}"), Some(255));
-        }
-    }
+    });
+    let complete = child.wait().then(move |result| async move {
+        let status = result
+            .map(|status| status.code())
+            .ok()
+            .flatten()
+            .unwrap_or(255);
+        job.result.write().await.status = Some(status);
+    });
+
+    join!(consume, complete);
 }
 
 async fn resolve_deploy_script(app: String) -> Result<(String, PathBuf), Rejection> {
     let script = std::env::current_dir()
         .unwrap()
         .join(format!("{app}.deploy"));
-    if !script.is_file() {
-        return Err(reject::custom(InvalidApplication));
+    if script.is_file() {
+        Ok((app, script))
+    } else {
+        Err(reject::custom(InvalidApplication))
     }
-    Ok((app, script))
 }
 
 type Jobs = Arc<RwLock<Vec<Arc<Job>>>>;
@@ -105,20 +123,20 @@ struct TemplateJob {
     id: Uuid,
     app: String,
     summary: String,
-    output: String,
+    output: Vec<OutputLine>,
 }
 
-impl From<&Job> for TemplateJob {
-    fn from(job: &Job) -> Self {
-        let (output, status) = &*job.result.read().unwrap();
+impl TemplateJob {
+    async fn from(job: &Job) -> Self {
+        let result = job.result.read().await;
         TemplateJob {
             id: job.id,
             app: job.app.clone(),
-            summary: match status {
+            summary: match result.status {
                 Some(status) => format!("Exit code: {status}"),
                 None => "Running...".to_owned(),
             },
-            output: output.clone(),
+            output: result.output.clone(),
         }
     }
 }
@@ -129,7 +147,7 @@ struct Index {
     jobs: Vec<TemplateJob>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     dotenv::dotenv().unwrap();
 
@@ -145,27 +163,24 @@ async fn main() {
         .and(verify_actions_secret(actions_secret))
         .and_then(resolve_deploy_script)
         .and(with_jobs(jobs.clone()))
-        .and_then(|(app, script): (String, PathBuf), jobs: Jobs| {
-            std::thread::spawn({
-                let app = app.clone();
-                move || {
-                    let job = Arc::new(Job::new(app));
-                    jobs.write().unwrap().push(job.clone());
-                    deploy_app(job, script);
-                }
-            });
+        .and_then(|(app, script): (String, PathBuf), jobs: Jobs| async move {
+            let job = Arc::new(Job::new(app.to_owned()));
+            jobs.write().await.push(job.clone());
+            tokio::spawn(deploy_app(job, script));
 
-            ready(Ok::<_, Rejection>(warp::reply::reply().into_response()))
+            Ok::<_, Rejection>(warp::reply::reply().into_response())
         });
 
-    let console = warp::get().and(warp::filters::path::end()).map(move || {
-        let jobs = jobs.read()
-            .unwrap()
-            .iter()
-            .map(|job| job.as_ref().into())
-            .collect::<Vec<_>>();
-        Index { jobs }
-    });
+    let console = warp::get()
+        .and(warp::filters::path::end())
+        .and(with_jobs(jobs))
+        .then(|jobs: Jobs| async move {
+            let jobs: Vec<_> = iter(jobs.read().await.iter())
+                .then(|job| TemplateJob::from(job.as_ref()))
+                .collect()
+                .await;
+            Index { jobs }
+        });
 
     warp::serve(deploy2.or(console))
         .run(([127, 0, 0, 1], port))
