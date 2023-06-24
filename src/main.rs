@@ -1,3 +1,4 @@
+use uuid::Uuid;
 use std::future::ready;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
@@ -6,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use warp::{reject, Filter, Rejection, Reply};
 
 struct Job {
+    id: Uuid,
     app: String,
     result: RwLock<(String, Option<i32>)>,
 }
@@ -13,6 +15,7 @@ struct Job {
 impl Job {
     fn new(app: String) -> Self {
         Self {
+            id: Uuid::new_v4(),
             app,
             result: RwLock::default(),
         }
@@ -75,7 +78,7 @@ fn deploy_app(job: Arc<Job>, script: PathBuf) {
             job.result.write().unwrap().1 = Some(status.code().unwrap_or(255));
         }
         Err(error) => {
-            *job.result.write().unwrap() = (format!("Error: {}", error), Some(255));
+            *job.result.write().unwrap() = (format!("Error: {error}"), Some(255));
         }
     }
 }
@@ -83,7 +86,7 @@ fn deploy_app(job: Arc<Job>, script: PathBuf) {
 async fn resolve_deploy_script(app: String) -> Result<(String, PathBuf), Rejection> {
     let script = std::env::current_dir()
         .unwrap()
-        .join(format!("{}.deploy", app));
+        .join(format!("{app}.deploy"));
     if !script.is_file() {
         return Err(reject::custom(InvalidApplication));
     }
@@ -96,6 +99,34 @@ fn with_jobs(
     jobs: Jobs,
 ) -> impl Filter<Extract = (Jobs,), Error = std::convert::Infallible> + Clone {
     warp::any().map(move || jobs.clone())
+}
+
+struct TemplateJob {
+    id: Uuid,
+    app: String,
+    summary: String,
+    output: String,
+}
+
+impl From<&Job> for TemplateJob {
+    fn from(job: &Job) -> Self {
+        let (output, status) = &*job.result.read().unwrap();
+        TemplateJob {
+            id: job.id,
+            app: job.app.clone(),
+            summary: match status {
+                Some(status) => format!("Exit code: {status}"),
+                None => "Running...".to_owned(),
+            },
+            output: output.clone(),
+        }
+    }
+}
+
+#[derive(askama::Template)]
+#[template(path = "index.html")]
+struct Index {
+    jobs: Vec<TemplateJob>,
 }
 
 #[tokio::main]
@@ -128,54 +159,12 @@ async fn main() {
         });
 
     let console = warp::get().and(warp::filters::path::end()).map(move || {
-        let jobs = jobs.read().unwrap();
-        let jobs_text = jobs
+        let jobs = jobs.read()
+            .unwrap()
             .iter()
-            .map(|job| {
-                let summary;
-                let details;
-                match &*job.result.read().unwrap() {
-                    (output, Some(status)) => {
-                        summary = format!("Exit code: {}", status);
-                        details = output.clone();
-                    }
-                    (output, None) => {
-                        summary = "Running...".into();
-                        details = output.clone();
-                    }
-                };
-                format!(
-                    r#"
-                    <div>
-                        <div>
-                            <b>App:</b> {}
-                        </div>
-                        <details>
-                            <summary>{}</summary>
-                            <pre>{}</pre>
-                        </details>
-                    </div>
-                    "#,
-                    job.app, summary, details
-                )
-            })
-            .collect::<String>();
-        warp::reply::html(
-            format!(
-                r#"
-                <!DOCTYPE HTML>
-                <html lang="en">
-                    <head>
-                        <title>Jobs</title>
-                        <meta charset="utf-8" />
-                    <body>{}</body>
-                </html>
-            "#,
-                jobs_text
-            )
-            .trim()
-            .to_owned(),
-        )
+            .map(|job| job.as_ref().into())
+            .collect::<Vec<_>>();
+        Index { jobs }
     });
 
     warp::serve(deploy2.or(console))

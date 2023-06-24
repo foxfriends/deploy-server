@@ -1,0 +1,18 @@
+<!DOCTYPE HTML>
+<html lang="en">
+  <head>
+    <title>Jobs | cameldridge.com</title>
+    <meta charset="utf-8" />
+  </head>
+  <body>
+    {% for job in jobs %}
+    <div id="{{ job.id }}">
+      <b>App:</b> {{ job.app|e }}
+      <details>
+          <summary>{{ job.summary|e }}</summary>
+          <pre>{{ job.output|e }}</pre>
+      </details>
+    </div>
+    {% endfor %}
+  </body>
+</html>
